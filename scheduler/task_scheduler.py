@@ -27,9 +27,11 @@ class TaskScheduler:
     """
 
     def __init__(self, db: DatabaseManager,
-                 on_new_content: Optional[Callable[[List[Dict]], None]] = None):
+                 on_new_content: Optional[Callable[[List[Dict]], None]] = None,
+                 on_fetch_error: Optional[Callable[[str, str], None]] = None):
         self.db = db
         self.on_new_content = on_new_content
+        self.on_fetch_error = on_fetch_error
         self._scheduler = BackgroundScheduler(
             executors={
                 "default": {"type": "threadpool", "max_workers": MAX_CONCURRENT_TASKS},
@@ -95,27 +97,64 @@ class TaskScheduler:
         if topic and topic["enabled"]:
             self._add_topic_job(topic)
 
-    def run_topic_now(self, topic_id: int):
-        """手动触发某主题的抓取（用于立即执行按钮）。"""
-        self._run_topic(topic_id)
+    def run_topic_now(self, topic_id: int) -> Dict[str, any]:
+        """手动触发某主题的抓取（用于立即执行按钮）。
 
-    def _run_topic(self, topic_id: int):
+        返回包含抓取统计信息的字典：
+        - topic_name: 主题名称
+        - sources_total: 总来源数
+        - sources_failed: 抓取失败来源数
+        - items_found: 解析到的条目总数
+        - items_filtered: 因相关性不足过滤的条目数
+        - items_duplicate: 因重复过滤的条目数
+        - items_added: 成功入库的条目数
+        - errors: 错误信息列表
+        """
+        return self._run_topic(topic_id)
+
+    def _run_topic(self, topic_id: int) -> Dict[str, any]:
         topic = self.db.get_topic(topic_id)
+        stats = {
+            "topic_id": topic_id,
+            "topic_name": topic["name"] if topic else "?",
+            "sources_total": len(topic["sources"]) if topic else 0,
+            "sources_failed": 0,
+            "items_found": 0,
+            "items_filtered": 0,
+            "items_duplicate": 0,
+            "items_added": 0,
+            "errors": [],
+        }
         if not topic or not topic["enabled"]:
-            return
+            stats["errors"].append("主题不存在或已禁用")
+            return stats
         with self._semaphore:
             logger.info("开始执行主题抓取: %s", topic["name"])
             new_articles: List[Dict] = []
             for source in topic["sources"]:
                 try:
                     items = collect(source)
+                    stats["items_found"] += len(items)
                 except Exception as exc:
-                    logger.exception("抓取 %s 失败: %s", source, exc)
+                    err_msg = f"抓取 {source} 失败: {exc}"
+                    logger.exception(err_msg)
+                    stats["sources_failed"] += 1
+                    stats["errors"].append(err_msg)
+                    if self.on_fetch_error:
+                        try:
+                            self.on_fetch_error(source, str(exc))
+                        except Exception as cb_exc:
+                            logger.warning("错误回调失败: %s", cb_exc)
                     continue
                 for item in items:
-                    article = self._process_item(item, topic)
+                    article, reason = self._process_item(item, topic)
                     if article:
                         new_articles.append(article)
+                        stats["items_added"] += 1
+                    elif reason == "filtered":
+                        stats["items_filtered"] += 1
+                    elif reason == "duplicate":
+                        stats["items_duplicate"] += 1
             self.db.update_topic_fetched(topic_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             if new_articles and self.on_new_content:
                 top = sorted(new_articles, key=lambda a: a["relevance_score"],
@@ -126,23 +165,33 @@ class TaskScheduler:
                         self.on_new_content(high)
                     except Exception as exc:
                         logger.warning("通知回调失败: %s", exc)
-            logger.info("主题 %s 抓取完成，新增 %d 篇相关文章",
-                        topic["name"], len(new_articles))
+            logger.info(
+                "主题 %s 抓取完成: 来源(%d/%d失败) 找到%d条 过滤%d条 去重%d条 新增%d条",
+                topic["name"], stats["sources_failed"], stats["sources_total"],
+                stats["items_found"], stats["items_filtered"],
+                stats["items_duplicate"], stats["items_added"],
+            )
+            return stats
 
-    def _process_item(self, item, topic: Dict) -> Optional[Dict]:
+    def _process_item(self, item, topic: Dict) -> tuple[Optional[Dict], Optional[str]]:
+        """处理单条采集结果。
+
+        返回 (article_dict, reason)，reason 为 None 表示成功入库，
+        否则为 'filtered' 或 'duplicate'。
+        """
         cleaned = ContentCleaner.clean_item(item.title, item.summary, item.content)
         if not cleaned["title"]:
-            return None
+            return None, "filtered"
         scorer = RelevanceScorer(topic["keywords"])
         score = scorer.score(cleaned["title"], cleaned["summary"], cleaned["content"])
         if score < RELEVANCE_THRESHOLD:
             logger.debug("过滤低相关文章: %s (得分 %.2f)", cleaned["title"], score)
-            return None
+            return None, "filtered"
         fingerprint = Simhash.from_text(cleaned["title"] + " " + cleaned["summary"])
         simhash_hex = fingerprint.to_hex()
         if self.db.article_exists_by_simhash(simhash_hex, DEDUP_HAMMING_DISTANCE):
             logger.debug("跳过重复文章: %s", cleaned["title"])
-            return None
+            return None, "duplicate"
         article = {
             "topic_id": topic["id"],
             "title": cleaned["title"],
@@ -158,8 +207,8 @@ class TaskScheduler:
         new_id = self.db.add_article(article)
         if new_id:
             article["id"] = new_id
-            return article
-        return None
+            return article, None
+        return None, "duplicate"
 
     def get_job_status(self) -> List[Dict]:
         jobs = self._scheduler.get_jobs()

@@ -312,10 +312,20 @@ class MainWindow:
 
     def _open_in_browser(self):
         if not self._current_article_id:
+            messagebox.showinfo("提示", "请先选择一篇文章", parent=self.root)
             return
         article = self.db.get_article(self._current_article_id)
-        if article and article["url"]:
+        if not article:
+            messagebox.showwarning("提示", "未找到该文章", parent=self.root)
+            return
+        if not article.get("url"):
+            messagebox.showwarning("提示", "该文章没有可用链接", parent=self.root)
+            return
+        try:
             webbrowser.open(article["url"])
+            self.status_var.set("已在浏览器中打开")
+        except Exception as exc:
+            messagebox.showerror("错误", f"打开浏览器失败: {exc}", parent=self.root)
 
     def _add_topic(self):
         dlg = TopicEditorDialog(self.root, self.db)
@@ -363,14 +373,62 @@ class MainWindow:
         threading.Thread(target=self._fetch_in_background, daemon=True).start()
 
     def _fetch_in_background(self):
+        stats = None
         try:
-            self.scheduler.run_topic_now(self._current_topic_id)
+            stats = self.scheduler.run_topic_now(self._current_topic_id)
         finally:
-            self.root.after(0, self._after_fetch)
+            self.root.after(0, self._after_fetch, stats)
 
-    def _after_fetch(self):
+    def _after_fetch(self, stats):
         self._refresh_articles()
-        self.status_var.set("抓取完成")
+        if not stats:
+            self.status_var.set("抓取完成")
+            return
+        topic_name = stats["topic_name"]
+        found = stats["items_found"]
+        added = stats["items_added"]
+        filtered = stats["items_filtered"]
+        duplicate = stats["items_duplicate"]
+        failed = stats["sources_failed"]
+        total = stats["sources_total"]
+        status_msg = (f"抓取完成: 「{topic_name}」 找到{found}条，"
+                      f"入库{added}条，过滤{filtered}条，去重{duplicate}条")
+        if failed > 0:
+            status_msg += f"，来源失败{failed}/{total}"
+        self.status_var.set(status_msg)
+        if added == 0 and found == 0 and stats["errors"]:
+            err_text = "\n".join(stats["errors"][:5])
+            if len(stats["errors"]) > 5:
+                err_text += f"\n... 共 {len(stats['errors'])} 条错误"
+            messagebox.showwarning(
+                "抓取完成但无内容",
+                f"未获取到任何文章。\n\n错误详情:\n{err_text}\n\n"
+                "可能的原因:\n1. 来源站点无法访问或解析失败\n2. 关键词设置与内容不匹配\n3. 网络连接问题或被反爬拦截",
+                parent=self.root,
+            )
+        elif added == 0 and found > 0:
+            messagebox.showinfo(
+                "抓取完成但已过滤",
+                f"共解析到 {found} 条内容，但全部未通过相关性筛选。\n"
+                f"（被过滤 {filtered} 条，重复 {duplicate} 条）\n\n"
+                "建议：调整关键词使其与来源内容更匹配",
+                parent=self.root,
+            )
+        elif stats["errors"]:
+            err_text = "\n".join(stats["errors"][:3])
+            messagebox.showwarning(
+                "抓取有部分错误",
+                f"成功入库 {added} 篇，但有 {len(stats['errors'])} 个来源抓取失败:\n\n{err_text}",
+                parent=self.root,
+            )
+
+    def handle_fetch_error(self, source: str, error: str):
+        """线程安全的「抓取错误」入口，由调度器回调。"""
+        self.root.after(0, self._on_fetch_error, source, error)
+
+    def _on_fetch_error(self, source: str, error: str):
+        logger.warning("抓取来源失败: %s - %s", source, error)
+        self.status_var.set(f"来源抓取失败: {source[:40]}")
 
     def handle_new_content(self, articles):
         """线程安全的「新内容到达」入口，由调度器回调。"""

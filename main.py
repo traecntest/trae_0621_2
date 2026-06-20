@@ -1,6 +1,7 @@
 import logging
 import sys
 import threading
+from tkinter import messagebox
 
 from config import APP_TITLE, APP_VERSION
 
@@ -27,10 +28,12 @@ def main():
         sys.exit(0)
 
     notifier = Notifier()
-    scheduler = TaskScheduler(db, on_new_content=lambda arts: None)
+    scheduler = TaskScheduler(db, on_new_content=lambda arts: None,
+                              on_fetch_error=lambda s, e: None)
     window = MainWindow(db, scheduler, notifier)
 
     scheduler.on_new_content = window.handle_new_content
+    scheduler.on_fetch_error = window.handle_fetch_error
 
     def on_close():
         window.minimize_to_tray()
@@ -55,9 +58,30 @@ def main():
 
 def _fetch_all(scheduler, window):
     def _worker():
+        total_added = 0
+        total_found = 0
+        total_failed = 0
+        errors = []
         for topic in scheduler.db.get_all_topics(enabled_only=True):
-            scheduler.run_topic_now(topic["id"])
-        window.root.after(0, window._refresh_articles)
+            stats = scheduler.run_topic_now(topic["id"])
+            total_added += stats["items_added"]
+            total_found += stats["items_found"]
+            total_failed += stats["sources_failed"]
+            errors.extend(stats["errors"])
+        def _update_ui():
+            window._refresh_articles()
+            status_msg = (f"批量抓取完成: 找到{total_found}条，入库{total_added}条")
+            if total_failed > 0:
+                status_msg += f"，失败{total_failed}个来源"
+            window.status_var.set(status_msg)
+            if errors:
+                err_text = "\n".join(errors[:3])
+                messagebox.showwarning(
+                    "批量抓取有错误",
+                    f"共 {len(errors)} 个错误:\n\n{err_text}",
+                    parent=window.root,
+                )
+        window.root.after(0, _update_ui)
     threading.Thread(target=_worker, daemon=True).start()
 
 
