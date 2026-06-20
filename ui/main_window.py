@@ -374,13 +374,27 @@ class MainWindow:
 
     def _fetch_in_background(self):
         stats = None
+        fetch_exception = None
         try:
             stats = self.scheduler.run_topic_now(self._current_topic_id)
+        except Exception as exc:
+            fetch_exception = exc
+            logger.exception("抓取任务异常")
         finally:
-            self.root.after(0, self._after_fetch, stats)
+            self.root.after(0, self._after_fetch, stats, fetch_exception)
 
-    def _after_fetch(self, stats):
+    def _after_fetch(self, stats, fetch_exception=None):
         self._refresh_articles()
+        if fetch_exception:
+            err_text = str(fetch_exception)
+            self.status_var.set(f"抓取失败: {err_text[:50]}")
+            messagebox.showerror(
+                "抓取失败",
+                f"抓取过程中发生未预期的错误:\n\n{err_text}\n\n"
+                "请检查网络连接或查看日志了解详情。",
+                parent=self.root,
+            )
+            return
         if not stats:
             self.status_var.set("抓取完成")
             return
@@ -391,15 +405,16 @@ class MainWindow:
         duplicate = stats["items_duplicate"]
         failed = stats["sources_failed"]
         total = stats["sources_total"]
+        errors = stats.get("errors", [])
         status_msg = (f"抓取完成: 「{topic_name}」 找到{found}条，"
                       f"入库{added}条，过滤{filtered}条，去重{duplicate}条")
         if failed > 0:
             status_msg += f"，来源失败{failed}/{total}"
         self.status_var.set(status_msg)
-        if added == 0 and found == 0 and stats["errors"]:
-            err_text = "\n".join(stats["errors"][:5])
-            if len(stats["errors"]) > 5:
-                err_text += f"\n... 共 {len(stats['errors'])} 条错误"
+        if errors and added == 0 and found == 0:
+            err_text = "\n".join(errors[:5])
+            if len(errors) > 5:
+                err_text += f"\n... 共 {len(errors)} 条错误"
             messagebox.showwarning(
                 "抓取完成但无内容",
                 f"未获取到任何文章。\n\n错误详情:\n{err_text}\n\n"
@@ -414,11 +429,20 @@ class MainWindow:
                 "建议：调整关键词使其与来源内容更匹配",
                 parent=self.root,
             )
-        elif stats["errors"]:
-            err_text = "\n".join(stats["errors"][:3])
+        elif errors:
+            err_text = "\n".join(errors[:3])
+            if len(errors) > 3:
+                err_text += f"\n... 共 {len(errors)} 条错误"
             messagebox.showwarning(
                 "抓取有部分错误",
-                f"成功入库 {added} 篇，但有 {len(stats['errors'])} 个来源抓取失败:\n\n{err_text}",
+                f"成功入库 {added} 篇，但有 {len(errors)} 个错误:\n\n{err_text}",
+                parent=self.root,
+            )
+        elif added == 0 and found == 0 and not errors:
+            messagebox.showinfo(
+                "抓取完成但无内容",
+                f"未解析到任何内容。\n\n"
+                "可能的原因:\n1. 来源站点页面结构已变化\n2. 来源站点需要浏览器渲染（B站等）\n3. 来源页面为空",
                 parent=self.root,
             )
 

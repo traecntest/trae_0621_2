@@ -62,23 +62,43 @@ def _fetch_all(scheduler, window):
         total_found = 0
         total_failed = 0
         errors = []
-        for topic in scheduler.db.get_all_topics(enabled_only=True):
-            stats = scheduler.run_topic_now(topic["id"])
-            total_added += stats["items_added"]
-            total_found += stats["items_found"]
-            total_failed += stats["sources_failed"]
-            errors.extend(stats["errors"])
+        fetch_exception = None
+        try:
+            for topic in scheduler.db.get_all_topics(enabled_only=True):
+                stats = scheduler.run_topic_now(topic["id"])
+                total_added += stats["items_added"]
+                total_found += stats["items_found"]
+                total_failed += stats["sources_failed"]
+                errors.extend(stats["errors"])
+        except Exception as exc:
+            fetch_exception = exc
         def _update_ui():
             window._refresh_articles()
+            if fetch_exception:
+                window.status_var.set(f"批量抓取失败: {str(fetch_exception)[:50]}")
+                messagebox.showerror(
+                    "批量抓取失败",
+                    f"批量抓取过程中发生错误:\n\n{fetch_exception}",
+                    parent=window.root,
+                )
+                return
             status_msg = (f"批量抓取完成: 找到{total_found}条，入库{total_added}条")
             if total_failed > 0:
                 status_msg += f"，失败{total_failed}个来源"
             window.status_var.set(status_msg)
             if errors:
                 err_text = "\n".join(errors[:3])
+                if len(errors) > 3:
+                    err_text += f"\n... 共 {len(errors)} 条错误"
                 messagebox.showwarning(
                     "批量抓取有错误",
                     f"共 {len(errors)} 个错误:\n\n{err_text}",
+                    parent=window.root,
+                )
+            elif total_added == 0 and total_found == 0:
+                messagebox.showinfo(
+                    "批量抓取完成",
+                    "未抓取到任何新内容。\n\n可能的原因:\n1. 来源站点无法访问\n2. 关键词设置与内容不匹配",
                     parent=window.root,
                 )
         window.root.after(0, _update_ui)

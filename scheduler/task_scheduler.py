@@ -128,49 +128,66 @@ class TaskScheduler:
         if not topic or not topic["enabled"]:
             stats["errors"].append("主题不存在或已禁用")
             return stats
-        with self._semaphore:
-            logger.info("开始执行主题抓取: %s", topic["name"])
-            new_articles: List[Dict] = []
-            for source in topic["sources"]:
-                try:
-                    items = collect(source)
-                    stats["items_found"] += len(items)
-                except Exception as exc:
-                    err_msg = f"抓取 {source} 失败: {exc}"
-                    logger.exception(err_msg)
-                    stats["sources_failed"] += 1
-                    stats["errors"].append(err_msg)
-                    if self.on_fetch_error:
-                        try:
-                            self.on_fetch_error(source, str(exc))
-                        except Exception as cb_exc:
-                            logger.warning("错误回调失败: %s", cb_exc)
-                    continue
-                for item in items:
-                    article, reason = self._process_item(item, topic)
-                    if article:
-                        new_articles.append(article)
-                        stats["items_added"] += 1
-                    elif reason == "filtered":
-                        stats["items_filtered"] += 1
-                    elif reason == "duplicate":
-                        stats["items_duplicate"] += 1
-            self.db.update_topic_fetched(topic_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-            if new_articles and self.on_new_content:
-                top = sorted(new_articles, key=lambda a: a["relevance_score"],
-                             reverse=True)[:RELEVANCE_TOP_N_NOTIFY]
-                high = [a for a in top if a["relevance_score"] >= NOTIFY_ON_RELEVANCE]
-                if high:
+        try:
+            with self._semaphore:
+                logger.info("开始执行主题抓取: %s", topic["name"])
+                new_articles: List[Dict] = []
+                for source in topic["sources"]:
                     try:
-                        self.on_new_content(high)
+                        items = collect(source)
+                        stats["items_found"] += len(items)
                     except Exception as exc:
-                        logger.warning("通知回调失败: %s", exc)
-            logger.info(
-                "主题 %s 抓取完成: 来源(%d/%d失败) 找到%d条 过滤%d条 去重%d条 新增%d条",
-                topic["name"], stats["sources_failed"], stats["sources_total"],
-                stats["items_found"], stats["items_filtered"],
-                stats["items_duplicate"], stats["items_added"],
-            )
+                        err_msg = f"抓取 {source} 失败: {exc}"
+                        logger.exception(err_msg)
+                        stats["sources_failed"] += 1
+                        stats["errors"].append(err_msg)
+                        if self.on_fetch_error:
+                            try:
+                                self.on_fetch_error(source, str(exc))
+                            except Exception as cb_exc:
+                                logger.warning("错误回调失败: %s", cb_exc)
+                        continue
+                    for item in items:
+                        try:
+                            article, reason = self._process_item(item, topic)
+                        except Exception as exc:
+                            err_msg = f"处理文章「{item.title}」失败: {exc}"
+                            logger.exception(err_msg)
+                            stats["errors"].append(err_msg)
+                            continue
+                        if article:
+                            new_articles.append(article)
+                            stats["items_added"] += 1
+                        elif reason == "filtered":
+                            stats["items_filtered"] += 1
+                        elif reason == "duplicate":
+                            stats["items_duplicate"] += 1
+                try:
+                    self.db.update_topic_fetched(topic_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                except Exception as exc:
+                    logger.warning("更新抓取时间戳失败: %s", exc)
+                if new_articles and self.on_new_content:
+                    top = sorted(new_articles, key=lambda a: a["relevance_score"],
+                                 reverse=True)[:RELEVANCE_TOP_N_NOTIFY]
+                    high = [a for a in top if a["relevance_score"] >= NOTIFY_ON_RELEVANCE]
+                    if high:
+                        try:
+                            self.on_new_content(high)
+                        except Exception as exc:
+                            logger.warning("通知回调失败: %s", exc)
+                logger.info(
+                    "主题 %s 抓取完成: 来源(%d/%d失败) 找到%d条 过滤%d条 去重%d条 新增%d条",
+                    topic["name"], stats["sources_failed"], stats["sources_total"],
+                    stats["items_found"], stats["items_filtered"],
+                    stats["items_duplicate"], stats["items_added"],
+                )
+                return stats
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            err_msg = f"抓取任务异常: {exc}"
+            logger.exception(err_msg)
+            stats["errors"].append(err_msg)
             return stats
 
     def _process_item(self, item, topic: Dict) -> tuple[Optional[Dict], Optional[str]]:
